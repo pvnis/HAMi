@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
 	"github.com/Project-HAMi/HAMi/pkg/device/common"
@@ -35,6 +36,7 @@ type AMDDevices struct {
 	resourceMemoryName string
 	defaultCUs         int
 	cuGroupSize        int
+	inflight           *inflightStore
 }
 
 const (
@@ -87,6 +89,7 @@ func InitAMDGPUDevice(config AMDConfig) *AMDDevices {
 		resourceMemoryName: config.ResourceMemoryName,
 		defaultCUs:         cus,
 		cuGroupSize:        group,
+		inflight:           newInflightStore(),
 	}
 }
 
@@ -133,6 +136,31 @@ func (dev *AMDDevices) GetNodeDevices(n corev1.Node) ([]*device.DeviceInfo, erro
 	if !ok || slices == 0 {
 		return []*device.DeviceInfo{}, fmt.Errorf("device not found %s", dev.resourceMemoryName)
 	}
+	// The AMD device plugin publishes the card's shape - framebuffer size,
+	// compute unit count and queue-mask granularity - read out of the KFD
+	// topology, exactly as HAMi's NVIDIA plugin publishes
+	// hami.io/node-nvidia-register. Prefer that over anything hand-set: the
+	// labels below are a fallback for a plugin too old to publish it.
+	if regd, err := parseRegistration(n.Annotations[RegisterAnnotation]); err == nil && len(regd) > 0 {
+		nodedevices := []*device.DeviceInfo{}
+		for _, r := range regd {
+			nodedevices = append(nodedevices, &device.DeviceInfo{
+				Index:        uint(r.NodeIdx),
+				ID:           r.ID,
+				Count:        int32(r.Count),
+				Devmem:       int32(r.DevMem),
+				Devcore:      int32(r.DevCore),
+				Type:         AMDDevice,
+				Numa:         0,
+				Health:       r.Health,
+				CustomInfo:   map[string]any{cuGroupKey: r.CUGroup},
+				DeviceVendor: AMDCommonWord,
+			})
+		}
+		klog.V(4).InfoS("registered AMD node devices from the plugin", "node", n.Name, "devices", len(nodedevices))
+		return nodedevices, nil
+	}
+
 	gpus := nodeInt(n, NodeGPUCountLabel, 1)
 	cus := nodeInt(n, NodeCUsLabel, dev.defaultCUs)
 
@@ -163,23 +191,57 @@ func (dev *AMDDevices) GetNodeDevices(n corev1.Node) ([]*device.DeviceInfo, erro
 //
 // The annotation is also how the next scheduling cycle learns which compute
 // units are taken — see Fit.
+// PatchAnnotations records the allocation on the pod and on the node.
+//
+// The pod gets the CU mask as a gVisor flag, which is what actually enforces
+// the compute partition: amdproxy applies it to every queue the sandbox
+// creates and the GPU's command processor honours it, so the sandbox cannot
+// widen it from inside.
+//
+// The node gets the same mask keyed by pod UID, because the pod annotation
+// cannot be read back — see cualloc.go. A failure to write the node record is
+// logged and not fatal: the pod still gets a correct, non-overlapping mask,
+// and the in-process overlay covers the gap until the next successful write.
 func (dev *AMDDevices) PatchAnnotations(pod *corev1.Pod, annoinput *map[string]string, pd device.PodDevices) map[string]string {
 	devlist, ok := pd[AMDDevice]
-	if ok && len(devlist) > 0 {
-		(*annoinput)[device.SupportDevices[AMDDevice]] = device.EncodePodSingleDevice(devlist)
-		for _, ctrdevs := range devlist {
-			for _, cd := range ctrdevs {
-				if mask, ok := cd.CustomInfo[cuMaskKey].(string); ok && mask != "" {
-					// CustomInfo does not survive EncodeContainerDevices, so
-					// the mask has to be written out as its own annotation.
-					(*annoinput)[CUMaskAnnotation] = mask
-					klog.InfoS("assigned AMD compute units", "pod", klog.KObj(pod), "device", cd.UUID, "cuMask", mask)
-				}
+	if !ok || len(devlist) == 0 {
+		return *annoinput
+	}
+	(*annoinput)[device.SupportDevices[AMDDevice]] = device.EncodePodSingleDevice(devlist)
+
+	for _, ctrdevs := range devlist {
+		for _, cd := range ctrdevs {
+			mask, ok := cd.CustomInfo[cuMaskKey].(string)
+			if !ok || mask == "" {
+				continue
+			}
+			(*annoinput)[CUMaskAnnotation] = mask
+			klog.InfoS("assigned AMD compute units", "pod", klog.KObj(pod), "device", cd.UUID, "cuMask", mask)
+
+			nodeName := nodeNameOf(cd.UUID)
+			if nodeName == "" {
+				klog.ErrorS(nil, "cannot derive a node name from the device ID; the CU allocation will not be recorded",
+					"device", cd.UUID)
+				continue
+			}
+			if err := recordCUAllocation(nodeName, string(pod.UID), cd.UUID, mask); err != nil {
+				klog.ErrorS(err, "recording the CU allocation on the node",
+					"node", nodeName, "pod", klog.KObj(pod), "cuMask", mask)
 			}
 		}
 	}
-	klog.V(4).InfoS("annos", "input", (*annoinput))
 	return *annoinput
+}
+
+// nodeNameOf recovers the node from a device ID of the form
+// "<node>-AMDGPU-<index>", which is how both this package and the AMD device
+// plugin construct it.
+func nodeNameOf(deviceID string) string {
+	i := strings.LastIndex(deviceID, "-"+AMDDevice+"-")
+	if i <= 0 {
+		return ""
+	}
+	return deviceID[:i]
 }
 
 func (dev *AMDDevices) LockNode(n *corev1.Node, p *corev1.Pod) error {
@@ -276,75 +338,34 @@ const cuMaskKey = "gvisorCUMask"
 // be parsed is treated as covering the whole device: refusing to place a pod is
 // a great deal better than handing out compute units that overlap someone
 // else's, which would silently break the partition rather than fail.
-func (amddevice *AMDDevices) occupiedCUs(dev *device.DeviceUsage, total int) cuSet {
-	var occupied cuSet
-	full := func() cuSet {
-		f := newCUSet(total)
-		for i := 0; i < total; i++ {
-			f.set(i)
-		}
-		return f
-	}
-
+// occupiedCUs returns the compute units already handed out on a device, from
+// the node's allocation record overlaid with anything this process has just
+// assigned. live is the set of pod UIDs currently placed on the device, used
+// to drop records for pods that have gone.
+//
+// The second return is false when occupancy cannot be determined, in which
+// case the caller must refuse to place rather than assume the device is free.
+func (amddevice *AMDDevices) occupiedCUs(node *corev1.Node, dev *device.DeviceUsage, total int) (cuSet, bool) {
+	live := map[string]bool{}
 	for _, pi := range dev.PodInfos {
-		if pi == nil {
-			continue
+		if pi != nil && pi.Pod != nil {
+			live[string(pi.Pod.UID)] = true
 		}
-		found := false
-
-		// The allocation HAMi recorded when it placed the pod. This is the
-		// only source that covers a pod placed moments ago in this same
-		// scheduling pass, whose annotation patch may not have been written
-		// yet — without it, two pods submitted together are both handed the
-		// lowest free run and the partition is not a partition.
-		for _, psd := range pi.Devices[AMDDevice] {
-			for _, cd := range psd {
-				raw := maskFromUUID(cd.UUID)
-				if raw == "" {
-					// Only set for an allocation made in this process; after a
-					// restart HAMi rebuilds from the annotation and the UUID
-					// suffix above is all that is left.
-					if v, ok := cd.CustomInfo[cuMaskKey].(string); ok {
-						raw = v
-					}
-				}
-				if raw == "" {
-					continue
-				}
-				mask, err := parseCUMask(raw)
-				if err != nil {
-					klog.ErrorS(err, "unreadable recorded CU mask; treating the device as fully occupied",
-						"pod", klog.KObj(pi.Pod), "mask", raw)
-					return full()
-				}
-				occupied.or(mask)
-				found = true
-			}
-		}
-		if found {
-			continue
-		}
-
-		// MEASURED, 2026-08-11: this fallback can never fire. pi.Pod is the pod
-		// as it arrived at the extender's filter request — phase Pending, with
-		// only the annotations admission wrote. Neither this mask nor even
-		// HAMi's own hami.io/amd-devices-allocated is on it, because both are
-		// patched after the filter returns. Reading occupancy back off placed
-		// pods is therefore not possible from here at all; the offsets need
-		// storage of their own. Kept as a no-op so the finding is not retried.
-		raw, ok := pi.Pod.Annotations[CUMaskAnnotation]
-		if !ok || raw == "" {
-			continue
-		}
-		mask, err := parseCUMask(raw)
-		if err != nil {
-			klog.ErrorS(err, "unreadable CU mask on a placed pod; treating the device as fully occupied",
-				"pod", klog.KObj(pi.Pod), "mask", raw)
-			return full()
-		}
-		occupied.or(mask)
 	}
-	return occupied
+
+	recorded := map[string]cuAllocation{}
+	if node != nil {
+		recorded = prune(parseAllocations(node.Annotations[CUAllocAnnotation]), live)
+	}
+	all := merge(amddevice.inflight.snapshot(dev.ID, time.Now()), recorded)
+
+	occupied, ok := occupiedFrom(all, dev.ID, total)
+	if !ok {
+		klog.ErrorS(nil, "unreadable CU allocation record; refusing to place rather than risk overlapping masks",
+			"device", dev.ID)
+		return nil, false
+	}
+	return occupied, true
 }
 
 // Fit picks a device with room for the request and assigns it a disjoint,
@@ -386,11 +407,22 @@ func (amddevice *AMDDevices) Fit(devices []*device.DeviceUsage, request device.C
 			total = amddevice.defaultCUs
 		}
 		want := cusForRequest(int64(k.Memreq), int64(dev.Totalmem), total, amddevice.cuGroupSize)
-		occ := amddevice.occupiedCUs(dev, total)
-		klog.InfoS("AMD CU occupancy", "pod", klog.KObj(pod), "device", dev.ID,
-			"podInfos", len(dev.PodInfos), "occupied", occ.String(), "occupiedCount", occ.count(),
-			"usedcores", dev.Usedcores, "usedmem", dev.Usedmem)
-		mask, ok := allocateCUs(occ, total, want, amddevice.cuGroupSize)
+		var nodeObj *corev1.Node
+		if nodeinfo != nil {
+			nodeObj = nodeinfo.Node
+		}
+		occ, readable := amddevice.occupiedCUs(nodeObj, dev, total)
+		if !readable {
+			reason[common.CardInsufficientCore]++
+			continue
+		}
+		group := amddevice.cuGroupSize
+		if g, ok := dev.CustomInfo[cuGroupKey].(int); ok && g > 0 {
+			group = g
+		}
+		klog.V(4).InfoS("AMD CU occupancy", "pod", klog.KObj(pod), "device", dev.ID,
+			"occupied", occ.String(), "occupiedCount", occ.count(), "wantCUs", want, "group", group)
+		mask, ok := allocateCUs(occ, total, want, group)
 		if !ok {
 			reason[common.CardInsufficientCore]++
 			klog.V(5).InfoS(common.CardInsufficientCore, "pod", klog.KObj(pod), "device", dev.ID,
@@ -398,6 +430,7 @@ func (amddevice *AMDDevices) Fit(devices []*device.DeviceUsage, request device.C
 			continue
 		}
 
+		amddevice.inflight.add(string(pod.UID), dev.ID, mask.String())
 		klog.InfoS("AMD device fits", "pod", klog.KObj(pod), "device", dev.ID,
 			"slices", k.Memreq, "cus", want, "cuMask", mask.String())
 		tmpDevs[k.Type] = append(tmpDevs[k.Type], device.ContainerDevice{

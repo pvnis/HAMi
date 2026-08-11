@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -162,11 +163,25 @@ func usage(totalSlices, totalCUs int32, pods ...*corev1.Pod) *device.DeviceUsage
 	return u
 }
 
-func podWithMask(mask string) *corev1.Pod {
-	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Name:        "placed",
-		Annotations: map[string]string{CUMaskAnnotation: mask},
-	}}
+func podWithUID(uid string) *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "placed-" + uid, UID: types.UID(uid)}}
+}
+
+// nodeWithAllocs builds the node record that Fit reads occupancy from.
+func nodeWithAllocs(allocs map[string]string) *device.NodeInfo {
+	m := map[string]cuAllocation{}
+	for uid, mask := range allocs {
+		m[uid] = cuAllocation{Device: "sens1-AMDGPU-0", Mask: mask}
+	}
+	enc, _ := formatAllocations(m)
+	return &device.NodeInfo{ID: "sens1", Node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "sens1", Annotations: map[string]string{CUAllocAnnotation: enc}}}}
+}
+
+// nodeWithRawAllocs allows a deliberately corrupt record.
+func nodeWithRawAllocs(raw string) *device.NodeInfo {
+	return &device.NodeInfo{ID: "sens1", Node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "sens1", Annotations: map[string]string{CUAllocAnnotation: raw}}}}
 }
 
 func maskFrom(t *testing.T, devs map[string]device.ContainerDevices) string {
@@ -199,7 +214,8 @@ func TestDevices_Fit(t *testing.T) {
 
 	// With a neighbour already holding the low 8, the next pod must be placed
 	// above it and must not overlap.
-	fit, devs, reason = dev.Fit([]*device.DeviceUsage{usage(23, 54, podWithMask("0xff"))}, req, pod, nil, nil)
+	fit, devs, reason = dev.Fit([]*device.DeviceUsage{usage(23, 54, podWithUID("u1"))}, req, pod,
+		nodeWithAllocs(map[string]string{"u1": "0xff"}), nil)
 	if !fit {
 		t.Fatalf("expected a fit, got %q", reason)
 	}
@@ -216,7 +232,8 @@ func TestFitRefusesWhenComputeIsExhausted(t *testing.T) {
 	// Every compute unit is spoken for. Placing the pod anyway would hand it
 	// units another sandbox is already using, so it must be refused.
 	full := "0x3fffffffffffff" // 54 CUs
-	fit, _, reason := dev.Fit([]*device.DeviceUsage{usage(23, 54, podWithMask(full))}, req, pod, nil, nil)
+	fit, _, reason := dev.Fit([]*device.DeviceUsage{usage(23, 54, podWithUID("u1"))}, req, pod,
+		nodeWithAllocs(map[string]string{"u1": full}), nil)
 	if fit {
 		t.Error("placed a pod on a device with no free compute units")
 	}
@@ -245,7 +262,8 @@ func TestFitTreatsUnreadableMasksAsOccupied(t *testing.T) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p"}}
 	req := device.ContainerDeviceRequest{Nums: 1, Type: AMDDevice, Memreq: 4}
 
-	fit, _, _ := dev.Fit([]*device.DeviceUsage{usage(23, 54, podWithMask("not-a-mask"))}, req, pod, nil, nil)
+	fit, _, _ := dev.Fit([]*device.DeviceUsage{usage(23, 54, podWithUID("u1"))}, req, pod,
+		nodeWithAllocs(map[string]string{"u1": "not-a-mask"}), nil)
 	if fit {
 		t.Error("placed a pod despite being unable to tell which compute units were free")
 	}
@@ -268,6 +286,8 @@ func Test_PatchAnnotations(t *testing.T) {
 			}},
 		},
 	}
+	// The node record cannot be written without a cluster; that failure is
+	// logged and non-fatal, and the pod annotations must still be correct.
 	got := dev.PatchAnnotations(pod, &anns, pd)
 
 	// The mask has to be written as its own annotation: CustomInfo does not
@@ -287,76 +307,124 @@ func Test_PatchAnnotations(t *testing.T) {
 // too. Reading the annotation alone hands two pods submitted together the same
 // compute units, which is exactly what happened on hardware before this.
 func TestFitSeesASiblingPlacedInTheSamePass(t *testing.T) {
+	// Two pods submitted together: the second is filtered before the first's
+	// node record is visible - measured at 8ms apart on hardware. The
+	// in-process overlay is what stops them both being handed the lowest run.
 	dev := testDevices()
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "second"}}
 	req := device.ContainerDeviceRequest{Nums: 1, Type: AMDDevice, Memreq: 4}
+	empty := &device.NodeInfo{ID: "sens1", Node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "sens1"}}}
 
-	sibling := &device.PodInfo{
-		Pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "first"}}, // no annotations
-		Devices: device.PodDevices{
-			AMDDevice: device.PodSingleDevice{
-				device.ContainerDevices{{
-					UUID:       "sens1-AMDGPU-0",
-					Type:       AMDDevice,
-					Usedmem:    4,
-					Usedcores:  8,
-					CustomInfo: map[string]any{cuMaskKey: "0xff"},
-				}},
-			},
-		},
-	}
-	u := usage(23, 54)
-	u.PodInfos = append(u.PodInfos, sibling)
-	u.Usedmem = 4
-
-	fit, devs, reason := dev.Fit([]*device.DeviceUsage{u}, req, pod, nil, nil)
-	if !fit {
-		t.Fatalf("expected a fit, got %q", reason)
-	}
-	if got := maskFrom(t, devs); got != "0xff00" {
-		t.Errorf("mask = %s, want 0xff00: must not reuse the sibling's 0xff", got)
-	}
-}
-
-// The mask must survive HAMi rebuilding its state from the pod annotation,
-// which happens on every node-usage refresh and after a scheduler restart.
-// EncodeContainerDevices writes only UUID,Type,Usedmem,Usedcores, so anything
-// kept in CustomInfo is gone by then — measured on hardware as two pods being
-// handed the identical mask while HAMi's own usedcores accounting was correct.
-func TestMaskSurvivesTheAnnotationRoundTrip(t *testing.T) {
-	t.Skip("UNSOLVED: there is no field yet that carries the CU offsets through " +
-		"EncodeContainerDevices. A UUID[...] suffix was tried and crash-loops " +
-		"the scheduler, because '[' is HAMi's MIG marker. Until this passes, " +
-		"co-located AMD pods can be handed overlapping masks.")
-
-	dev := testDevices()
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "first"}}
-	req := device.ContainerDeviceRequest{Nums: 1, Type: AMDDevice, Memreq: 4}
-
-	_, devs, _ := dev.Fit([]*device.DeviceUsage{usage(23, 54)}, req, pod, nil, nil)
-	encoded := device.EncodeContainerDevices(devs[AMDDevice])
-	decoded, err := device.DecodeContainerDevices(encoded)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := maskFromUUID(decoded[0].UUID); got != "0xff" {
-		t.Fatalf("mask after a round trip = %q, want 0xff (encoded: %q)", got, encoded)
+	first := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "first", UID: types.UID("u1")}}
+	_, devs1, _ := dev.Fit([]*device.DeviceUsage{usage(23, 54)}, req, first, empty, nil)
+	if got := maskFrom(t, devs1); got != "0xff" {
+		t.Fatalf("first mask = %s, want 0xff", got)
 	}
 
-	// And a second pod placed against that decoded state must not overlap.
-	u := usage(23, 54)
-	u.Usedmem = 4
-	u.PodInfos = append(u.PodInfos, &device.PodInfo{
-		Pod:     &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "first"}},
-		Devices: device.PodDevices{AMDDevice: device.PodSingleDevice{decoded}},
-	})
-	fit, devs2, reason := dev.Fit([]*device.DeviceUsage{u},
-		device.ContainerDeviceRequest{Nums: 1, Type: AMDDevice, Memreq: 4},
-		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "second"}}, nil, nil)
+	// Nothing has been written to the node yet, and the second pod's own
+	// DeviceUsage still shows an empty device.
+	second := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "second", UID: types.UID("u2")}}
+	fit, devs2, reason := dev.Fit([]*device.DeviceUsage{usage(23, 54)}, req, second, empty, nil)
 	if !fit {
 		t.Fatalf("expected a fit, got %q", reason)
 	}
 	if got := maskFrom(t, devs2); got != "0xff00" {
-		t.Errorf("second mask = %s, want 0xff00", got)
+		t.Errorf("second mask = %s, want 0xff00: must not reuse the sibling's run", got)
+	}
+}
+
+// A pod that has gone releases its compute units without anything having to
+// clean up after it: its record is dropped because it is no longer among the
+// device's PodInfos.
+func TestDepartedPodsReleaseTheirCUs(t *testing.T) {
+	dev := testDevices()
+	req := device.ContainerDeviceRequest{Nums: 1, Type: AMDDevice, Memreq: 4}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "new", UID: types.UID("u9")}}
+
+	// The node still records u1 and u2, but only u2 is still placed.
+	node := nodeWithAllocs(map[string]string{"u1": "0xff", "u2": "0xff00"})
+	devs := []*device.DeviceUsage{usage(23, 54, podWithUID("u2"))}
+
+	fit, got, reason := dev.Fit(devs, req, pod, node, nil)
+	if !fit {
+		t.Fatalf("expected a fit, got %q", reason)
+	}
+	if m := maskFrom(t, got); m != "0xff" {
+		t.Errorf("mask = %s, want 0xff: u1 has gone so its run is free again", m)
+	}
+}
+
+// The node record is the durable channel now, so what has to survive is the
+// annotation round trip of that record, not of the device encoding.
+func TestNodeRecordRoundTrip(t *testing.T) {
+	in := map[string]cuAllocation{
+		"u1": {Device: "sens1-AMDGPU-0", Mask: "0xff"},
+		"u2": {Device: "sens1-AMDGPU-0", Mask: "0xff00"},
+	}
+	enc, err := formatAllocations(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := parseAllocations(enc)
+	if len(out) != 2 || out["u1"].Mask != "0xff" || out["u2"].Device != "sens1-AMDGPU-0" {
+		t.Fatalf("round trip lost data: %v", out)
+	}
+
+	occ, ok := occupiedFrom(out, "sens1-AMDGPU-0", 54)
+	if !ok {
+		t.Fatal("occupancy unreadable")
+	}
+	if occ.String() != "0xffff" {
+		t.Errorf("occupied = %s, want 0xffff", occ.String())
+	}
+
+	// A record for a different device must not count against this one.
+	out["u3"] = cuAllocation{Device: "sens1-AMDGPU-1", Mask: "0x3f"}
+	occ, _ = occupiedFrom(out, "sens1-AMDGPU-0", 54)
+	if occ.String() != "0xffff" {
+		t.Errorf("occupied = %s after adding another device's record, want 0xffff", occ.String())
+	}
+
+	// Garbage must report unreadable rather than empty.
+	if _, ok := occupiedFrom(map[string]cuAllocation{"u": {Device: "sens1-AMDGPU-0", Mask: "nope"}}, "sens1-AMDGPU-0", 54); ok {
+		t.Error("an unparseable mask should report the device as unreadable")
+	}
+	if got := parseAllocations("{not json"); len(got) != 0 {
+		t.Errorf("corrupt annotation should parse to nothing, got %v", got)
+	}
+}
+
+// The AMD device plugin publishes the card's real shape; that must win over
+// the node labels and the configured default, which are only a fallback.
+func TestGetNodeDevicesPrefersThePluginRegistration(t *testing.T) {
+	dev := testDevices()
+	n := testNode()
+	n.Labels[NodeCUsLabel] = "999" // deliberately wrong
+	n.Annotations = map[string]string{
+		RegisterAnnotation: `[{"id":"sens1-AMDGPU-1","count":23,"devmem":23,"devcore":54,` +
+			`"cugroup":2,"type":"ip discovery","health":true,"nodeindex":1}]`,
+	}
+
+	got, err := dev.GetNodeDevices(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d devices, want 1", len(got))
+	}
+	if got[0].Devcore != 54 {
+		t.Errorf("Devcore = %d, want the plugin's 54, not the label's 999", got[0].Devcore)
+	}
+	if got[0].ID != "sens1-AMDGPU-1" {
+		t.Errorf("ID = %q, want the plugin's id", got[0].ID)
+	}
+	if g, ok := got[0].CustomInfo[cuGroupKey].(int); !ok || g != 2 {
+		t.Errorf("cuGroup = %v, want 2 carried from the registration", got[0].CustomInfo[cuGroupKey])
+	}
+
+	// A malformed registration falls back rather than failing the node.
+	n.Annotations[RegisterAnnotation] = "{garbage"
+	got, err = dev.GetNodeDevices(n)
+	if err != nil || len(got) != 1 || got[0].Devcore != 999 {
+		t.Errorf("expected fallback to the label, got %v err=%v", got, err)
 	}
 }
