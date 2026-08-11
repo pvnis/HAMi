@@ -399,9 +399,12 @@ func TestGetNodeDevicesPrefersThePluginRegistration(t *testing.T) {
 	dev := testDevices()
 	n := testNode()
 	n.Labels[NodeCUsLabel] = "999" // deliberately wrong
+	// Exactly the shape Project-HAMi/amd-device-plugin publishes, with our
+	// two extensions inside custominfo where they cannot collide.
 	n.Annotations = map[string]string{
-		RegisterAnnotation: `[{"id":"sens1-AMDGPU-1","count":23,"devmem":23,"devcore":54,` +
-			`"cugroup":2,"type":"ip discovery","health":true,"nodeindex":1}]`,
+		RegisterAnnotation: `[{"id":"sens1-AMDGPU-1","index":1,"count":23,"devmem":12272,` +
+			`"devcore":54,"type":"ip discovery","numa":0,"health":true,` +
+			`"devicevendor":"amd","custominfo":{"cuGroup":2,"sliceMiB":512}}]`,
 	}
 
 	got, err := dev.GetNodeDevices(n)
@@ -417,6 +420,10 @@ func TestGetNodeDevicesPrefersThePluginRegistration(t *testing.T) {
 	if got[0].ID != "sens1-AMDGPU-1" {
 		t.Errorf("ID = %q, want the plugin's id", got[0].ID)
 	}
+	// devmem is MiB upstream; the scheduler works in advertised slice units.
+	if got[0].Devmem != 23 {
+		t.Errorf("Devmem = %d, want 12272 MiB converted to 23 slices", got[0].Devmem)
+	}
 	if g, ok := got[0].CustomInfo[cuGroupKey].(int); !ok || g != 2 {
 		t.Errorf("cuGroup = %v, want 2 carried from the registration", got[0].CustomInfo[cuGroupKey])
 	}
@@ -426,5 +433,34 @@ func TestGetNodeDevicesPrefersThePluginRegistration(t *testing.T) {
 	got, err = dev.GetNodeDevices(n)
 	if err != nil || len(got) != 1 || got[0].Devcore != 999 {
 		t.Errorf("expected fallback to the label, got %v err=%v", got, err)
+	}
+}
+
+// A registration from the upstream plugin carries neither of our custominfo
+// extensions. It must still work: capacity falls back to the count it
+// advertised and the granularity to the configured default.
+func TestUpstreamRegistrationWithoutOurExtensions(t *testing.T) {
+	dev := testDevices()
+	n := testNode()
+	delete(n.Labels, NodeCUsLabel)
+	n.Annotations = map[string]string{
+		RegisterAnnotation: `[{"id":"n-AMDGPU-0","index":0,"count":10,"devmem":196288,` +
+			`"devcore":304,"type":"AMD Instinct MI300X VF","numa":0,"health":true,` +
+			`"devicevendor":"amd","custominfo":{"pciBDF":"0000:83:00.0"}}]`,
+	}
+	got, err := dev.GetNodeDevices(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Devmem != 10 {
+		t.Errorf("Devmem = %d, want the advertised count of 10", got[0].Devmem)
+	}
+	if got[0].Devcore != 304 {
+		t.Errorf("Devcore = %d, want 304", got[0].Devcore)
+	}
+	// MI300X is CDNA and does not pair, but nothing in the payload says so, so
+	// the configured default stands rather than a guess.
+	if g, _ := got[0].CustomInfo[cuGroupKey].(int); g != 2 {
+		t.Errorf("cuGroup = %d, want the configured default 2", g)
 	}
 }

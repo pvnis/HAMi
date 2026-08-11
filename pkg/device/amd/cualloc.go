@@ -172,29 +172,60 @@ func merge(a, b map[string]cuAllocation) map[string]cuAllocation {
 	return out
 }
 
-// registeredDevice mirrors what the AMD device plugin publishes as
-// hami.io/node-amd-register, in the shape HAMi's NVIDIA plugin uses for
-// hami.io/node-nvidia-register.
+// registeredDevice is what a plugin publishes as hami.io/node-amd-register.
+//
+// The field names and meanings follow Project-HAMi/amd-device-plugin, which
+// serialises HAMi's own device.DeviceInfo — the same shape as
+// hami.io/node-nvidia-register. Matching it exactly means this scheduler can
+// read a node registered by the upstream plugin, and that our plugin and
+// theirs cannot disagree about a key they both write.
+//
+// devmem is MiB. The resource is advertised in fixed-size slices, so the
+// scheduler converts using sliceMiB from custominfo.
 type registeredDevice struct {
-	ID      string `json:"id"`
-	Count   int    `json:"count"`
-	DevMem  int    `json:"devmem"`
-	DevCore int    `json:"devcore"`
-	CUGroup int    `json:"cugroup"`
-	Type    string `json:"type"`
-	Health  bool   `json:"health"`
-	NodeIdx int    `json:"nodeindex"`
+	ID           string         `json:"id"`
+	Index        int            `json:"index"`
+	Count        int            `json:"count"`
+	DevMem       int            `json:"devmem"`
+	DevCore      int            `json:"devcore"`
+	Type         string         `json:"type"`
+	Numa         int            `json:"numa"`
+	Health       bool           `json:"health"`
+	DeviceVendor string         `json:"devicevendor"`
+	CustomInfo   map[string]any `json:"custominfo"`
 }
 
-// RegisterAnnotation is where the AMD device plugin publishes the node's GPUs.
-const RegisterAnnotation = "hami.io/node-amd-register"
+// intFromCustom reads an integer out of custominfo, which round-trips through
+// JSON as a float64.
+func intFromCustom(m map[string]any, key string) (int, bool) {
+	v, ok := m[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	}
+	return 0, false
+}
 
-// cuGroupKey carries the queue-mask granularity from the plugin's registration
-// through to Fit. The plugin derives it from gfx_target_version, which is the
-// only place the truth lives: RDNA pairs compute units and KFD refuses a mask
-// that splits a pair, CDNA does not pair, and guessing wrong makes containers
-// hang rather than fail.
-const cuGroupKey = "gvisorCUGroup"
+// SlicesAndGroup returns the device's capacity in advertised slice units and
+// its queue-mask granularity. A registration from the upstream plugin carries
+// neither extension, so both fall back: capacity to the count it advertised,
+// and the group to the caller's configured default.
+func (r registeredDevice) SlicesAndGroup(defaultGroup int) (slices, group int) {
+	slices = r.Count
+	if sliceMiB, ok := intFromCustom(r.CustomInfo, "sliceMiB"); ok && sliceMiB > 0 && r.DevMem > 0 {
+		slices = r.DevMem / sliceMiB
+	}
+	group = defaultGroup
+	if g, ok := intFromCustom(r.CustomInfo, "cuGroup"); ok && g > 0 {
+		group = g
+	}
+	return slices, group
+}
 
 func parseRegistration(s string) ([]registeredDevice, error) {
 	if s == "" {
@@ -206,3 +237,12 @@ func parseRegistration(s string) ([]registeredDevice, error) {
 	}
 	return out, nil
 }
+
+// RegisterAnnotation is where a plugin publishes the node's AMD GPUs. The key
+// is shared with Project-HAMi/amd-device-plugin, which is why the payload
+// above matches theirs field for field.
+const RegisterAnnotation = "hami.io/node-amd-register"
+
+// cuGroupKey carries the queue-mask granularity from the registration through
+// to Fit, inside HAMi's own per-device CustomInfo.
+const cuGroupKey = "gvisorCUGroup"

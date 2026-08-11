@@ -144,16 +144,17 @@ func (dev *AMDDevices) GetNodeDevices(n corev1.Node) ([]*device.DeviceInfo, erro
 	if regd, err := parseRegistration(n.Annotations[RegisterAnnotation]); err == nil && len(regd) > 0 {
 		nodedevices := []*device.DeviceInfo{}
 		for _, r := range regd {
+			slices, group := r.SlicesAndGroup(dev.cuGroupSize)
 			nodedevices = append(nodedevices, &device.DeviceInfo{
-				Index:        uint(r.NodeIdx),
+				Index:        uint(r.Index),
 				ID:           r.ID,
-				Count:        int32(r.Count),
-				Devmem:       int32(r.DevMem),
+				Count:        int32(slices),
+				Devmem:       int32(slices),
 				Devcore:      int32(r.DevCore),
 				Type:         AMDDevice,
-				Numa:         0,
+				Numa:         r.Numa,
 				Health:       r.Health,
-				CustomInfo:   map[string]any{cuGroupKey: r.CUGroup},
+				CustomInfo:   map[string]any{cuGroupKey: group},
 				DeviceVendor: AMDCommonWord,
 			})
 		}
