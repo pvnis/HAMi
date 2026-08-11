@@ -325,12 +325,13 @@ func (amddevice *AMDDevices) occupiedCUs(dev *device.DeviceUsage, total int) cuS
 			continue
 		}
 
-		// Falling back to the annotation covers pods that outlived the
-		// scheduler: CustomInfo does not survive being encoded into the
-		// annotation and decoded back, so after a restart this is all there is.
-		if pi.Pod == nil {
-			continue
-		}
+		// MEASURED, 2026-08-11: this fallback can never fire. pi.Pod is the pod
+		// as it arrived at the extender's filter request — phase Pending, with
+		// only the annotations admission wrote. Neither this mask nor even
+		// HAMi's own hami.io/amd-devices-allocated is on it, because both are
+		// patched after the filter returns. Reading occupancy back off placed
+		// pods is therefore not possible from here at all; the offsets need
+		// storage of their own. Kept as a no-op so the finding is not retried.
 		raw, ok := pi.Pod.Annotations[CUMaskAnnotation]
 		if !ok || raw == "" {
 			continue
